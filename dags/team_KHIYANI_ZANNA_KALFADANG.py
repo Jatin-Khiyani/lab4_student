@@ -20,11 +20,11 @@ from airflow.utils.task_group import TaskGroup
 
 from include.ingest import ingest_day, validate_silver
 from include.paths import report_json
-from include.team_franklin_spark import run_daily
+from include.team_KHIYANI_ZANNA_KALFADANG_spark import run_daily
 
 DEFAULT_ARGS = {
-    "owner": "team_franklin",
-    "retries": 2,                        # Track R — retry twice before marking failed
+    "owner": "KHIYANI_ZANNA_KALFADANG",
+    "retries": 0,                        # Track R — retry twice before marking failed
     "retry_delay": timedelta(minutes=3),
     "email_on_failure": False,
 }
@@ -46,7 +46,7 @@ def _write_failure_marker(context) -> None:
 
 
 with DAG(
-    dag_id="team_franklin",
+    dag_id="KHIYANI_ZANNA_KALFADANG",
     description="Capstone retail KPI pipeline — Team Franklin",
     start_date=datetime(2026, 6, 1),
     end_date=datetime(2026, 6, 14),
