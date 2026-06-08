@@ -1,130 +1,117 @@
+"""
+Lab 4 Capstone DAG — Team Franklin
+
+Tracks implemented:
+  R  Reliability   — retries=2 on every task, FileSensor timeout=20 min,
+                     on_failure_callback writes a marker file to data/reports/
+  O  Orchestration — TaskGroup "bronze_to_silver" and "silver_to_gold"
+  Q  Data quality  — validate_silver called with min_revenue=1.0 so a
+                     --corrupt day (all zeros) turns the validate task red
+"""
 from __future__ import annotations
-from  include.team_franklin_spark import run_daily 
-import os
-import shutil
+
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from airflow import DAG
 from airflow.decorators import task
-from airflow.exceptions import AirflowFailException
 from airflow.sensors.filesystem import FileSensor
+from airflow.utils.task_group import TaskGroup
 
-# Importations des modules fournis par le kit d'origine
 from include.ingest import ingest_day, validate_silver
 from include.paths import report_json
-
-# 1. IMPORTATION DE TON SCRIPT PYSPARK INDIVIDUEL (Étape 2 & 4)
-# Une fois ton fichier créé dans include/team_franklin_spark.py, décommente la ligne suivante :
-# from include.team_franklin_spark import run_daily
+from include.team_franklin_spark import run_daily
 
 DEFAULT_ARGS = {
     "owner": "team_franklin",
-    "retries": 0,                      # Track R: Gestion de la fiabilité (essais automatiques)
+    "retries": 2,                        # Track R — retry twice before marking failed
     "retry_delay": timedelta(minutes=3),
+    "email_on_failure": False,
 }
 
+
+def _write_failure_marker(context) -> None:
+    """
+    Track R — on any task failure, write a plain-text breadcrumb so ops
+    can spot the problem without opening the Airflow UI.
+    """
+    ds      = context["ds"]
+    task_id = context["task_instance"].task_id
+    marker  = Path("/opt/airflow/data/reports") / f"FAILED_{ds}_{task_id}.txt"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        f"FAILURE  task={task_id}  ds={ds}  run_id={context['run_id']}\n",
+        encoding="utf-8",
+    )
+
+
 with DAG(
-    dag_id="team_franklin",               # Étape 1 : Identifiant unique de ton DAG
-    description="Pipeline Capstone de calcul des KPIs de vente au détail",
-    start_date=datetime(2026, 6, 1),   # Plage temporelle du projet
-    end_date=datetime(2026, 6, 14),     
-    schedule="@daily",                 # Exécution logique quotidienne
-    catchup=False,                     # Désactivé par défaut, activable pour le backfill
+    dag_id="team_franklin",
+    description="Capstone retail KPI pipeline — Team Franklin",
+    start_date=datetime(2026, 6, 1),
+    end_date=datetime(2026, 6, 14),
+    schedule="@daily",
+    catchup=False,
     default_args=DEFAULT_ARGS,
     tags=["lab4", "capstone", "franklin"],
 ) as dag:
 
-    # -------------------------------------------------------------------------
-    # TÂCHE 1 : FileSensor (Vérification de l'arrivée du fichier CSV du fournisseur)
-    # -------------------------------------------------------------------------
+    # ── Task 1: wait for vendor CSV ────────────────────────────────────────
     wait_csv = FileSensor(
         task_id="wait_for_vendor_csv",
-        filepath="incoming/transactions_{{ ds }}.csv", # Interpolation Jinja de la date logique (ds)
-        fs_conn_id="fs_default",
-        poke_interval=30,               # Intervalle de vérification (secondes)
-        timeout=600,                    # Évite de bloquer un worker indéfiniment
-        mode="poke",
+        filepath="/opt/airflow/data/incoming/transactions_{{ ds }}.csv",
+        poke_interval=30,
+        timeout=60 * 20,           # Track R — stop waiting after 20 min
+        mode="reschedule",
+        on_failure_callback=_write_failure_marker,
     )
 
-    # -------------------------------------------------------------------------
-    # TÂCHE 2 : Ingestion Bronze -> Silver via DuckDB
-    # -------------------------------------------------------------------------
-    @task(task_id="ingest_bronze_to_silver")
-    def task_ingest(ds=None):
-        """Prend le CSV brut et génère un fichier Parquet nettoyé et typé (Silver)"""
-        print(f"Début de l'ingestion DuckDB pour la date logique : {ds}")
-        ingest_day(ds)                  
+    # ── TaskGroup: Bronze → Silver  (Track O) ─────────────────────────────
+    with TaskGroup("bronze_to_silver") as bronze_to_silver:
 
-    # -------------------------------------------------------------------------
-    # TÂCHE 3 : Validation des données Silver (Créativité / Data Quality)
-    # -------------------------------------------------------------------------
-    @task(task_id="validate_silver_data")
-    def task_validate(ds: str):
-        """
+        @task(on_failure_callback=_write_failure_marker)
+        def ingest(ds: str) -> dict:
+            """Task 2 — read CSV, write typed silver Parquet via DuckDB."""
+            return ingest_day(ds)
 
-        Vérifie la conformité des données Silver.
+        @task(on_failure_callback=_write_failure_marker)
+        def validate(ds: str) -> dict:
+            """
+            Task 3 — Track Q: min_revenue=1.0 means a --corrupt day
+            (all amount_eur = 0) raises RuntimeError and turns red here,
+            blocking Spark from running on bad data.
+            """
+            return validate_silver(ds, min_rows=10, min_revenue=1.0)
 
-        Si les données sont corrompues, la tâche passe en FAILED dans Airflow.
+        ingest_result   = ingest()
+        validate_result = validate()
+        ingest_result >> validate_result
 
-        """
-        print(f"Validation de la qualité des données Silver pour : {ds}")
+    # ── TaskGroup: Silver → Gold  (Track O) ───────────────────────────────
+    with TaskGroup("silver_to_gold") as silver_to_gold:
 
-        is_valid = validate_silver(ds)
+        @task(on_failure_callback=_write_failure_marker)
+        def compute_kpis(ds: str) -> dict:
+            """
+            Task 4 — PySpark job:
+              transform_1 (read + schema) ->
+              transform_2 (enrich + broadcast join) ->
+              transform_3 (aggregate KPIs)
+            Writes curated Parquet + dashboard JSON.
+            """
+            return run_daily(ds, with_reference=True)
 
-        if not is_valid:
+        @task(on_failure_callback=_write_failure_marker)
+        def publish(ds: str) -> dict:
+            """Task 5 — verify dashboard JSON was written; return its path."""
+            path = report_json(ds)
+            if not path.exists():
+                raise FileNotFoundError(f"Report missing: {path}")
+            return {"report_path": str(path), "status": "ready"}
 
-            raise AirflowFailException(
+        compute_result = compute_kpis()
+        publish_result = publish()
+        compute_result >> publish_result
 
-                f"Échec de qualité des données pour {ds}. "
-
-                "Les données Silver sont invalides ou corrompues."
-
-            )
-
-        print(f"Validation réussie pour {ds}")
-        return True
-
-    # -------------------------------------------------------------------------
-    # TÂCHE 4 : Traitement Analytique Gold via PySpark (Ton code Spark central)
-    # -------------------------------------------------------------------------
-    @task(task_id="compute_pyspark_kpis")
-    def task_spark(ds=None):
-        """
-        Exécute la session de calcul PySpark locale (local[*]).
-        Génère le Parquet Gold et le fichier JSON de reporting.
-        """
-        print(f"Lancement du job d'agrégation PySpark pour : {ds}")
-        run_daily(ds)
-        
-
-    # -------------------------------------------------------------------------
-    # TÂCHE 5 : Diffusion / Sauvegarde secondaire (Créativité / Idempotence)
-    # -------------------------------------------------------------------------
-    @task(task_id="export_summary_backup")
-    def task_export_backup(ds=None):
-        """
-        Garantit l'idempotence en fin de chaîne et copie le livrable JSON
-        généré dans un dossier de sauvegarde secondaire (Serve layer).
-        """
-        source_json = report_json(ds)
-        backup_dir = "data/reports_backup"
-        backup_json = f"{backup_dir}/dashboard_{ds}.json"
-        
-        # Idempotence : Nettoyage d'une ancienne sauvegarde si elle existe déjà pour éviter les doublons
-        if os.path.exists(backup_json):
-            print(f"Ancien rapport trouvé pour {ds}. Suppression pour idempotence...")
-            os.remove(backup_json)
-            
-        os.makedirs(backup_dir, exist_ok=True)
-        
-        if os.path.exists(source_json):
-            shutil.copy(source_json, backup_json)
-            print(f"✅ Rapport exporté avec succès vers la sauvegarde : {backup_json}")
-        else:
-            raise FileNotFoundError(f"Le fichier source généré est introuvable : {source_json}")
-
-    # -------------------------------------------------------------------------
-    # ORCHESTRATION ET CHAINAGE DES DEPENDANCES (Le graphe de flux)
-    # -------------------------------------------------------------------------
-    # Le pipeline s'exécute linéairement : Attente -> Ingestion -> Validation -> Spark -> Sauvegarde
-    wait_csv >> task_ingest() >> task_validate() >> task_spark() >> task_export_backup()
+    # ── Top-level dependency graph ─────────────────────────────────────────
+    wait_csv >> bronze_to_silver >> silver_to_gold

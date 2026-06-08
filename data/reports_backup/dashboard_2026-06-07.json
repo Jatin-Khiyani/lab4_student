@@ -1,0 +1,9 @@
+{
+    "logical_date": "2026-06-07",
+    "status": "success",
+    "total_revenue_eur": 25615.59,
+    "total_transactions_count": 200,
+    "paths": {
+        "gold_parquet": "data/curated/dt=2026-06-07/"
+    }
+}

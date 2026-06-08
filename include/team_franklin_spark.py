@@ -1,128 +1,188 @@
+"""
+Team Franklin — PySpark KPI job for Lab 4 capstone.
+
+Transforms
+  1. transform_1  read silver Parquet with strict schema, filter bad rows
+  2. transform_2  enrich: parse hour of day + broadcast join category targets (Track S)
+  3. transform_3  aggregate KPIs by category × country with revenue-vs-target %
+"""
 from __future__ import annotations
 
-import os
 import json
+
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType
+from pyspark.sql.types import (
+    DoubleType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
-# -------------------------------------------------------------------------
-# DÉFINITION DU SCHÉMA STRICT (Sécurité & Track S: Spark Depth)
-# -------------------------------------------------------------------------
-# Le fournisseur génère des colonnes réalistes (tx_id, category, country, amount_eur...)
+from include.paths import curated_kpis, raw_parquet, reference_targets, report_json
+
+# Explicit schema — Track S requirement; rejects rows that don't match at read time
 SILVER_SCHEMA = StructType([
-    StructField("tx_id", StringType(), False),
-    StructField("category", StringType(), True),
-    StructField("country", StringType(), True),
-    StructField("amount_eur", DoubleType(), True),
+    StructField("tx_id",          StringType(),    nullable=False),
+    StructField("category",       StringType(),    nullable=False),
+    StructField("payment_method", StringType(),    nullable=True),
+    StructField("country",        StringType(),    nullable=False),
+    StructField("amount_eur",     DoubleType(),    nullable=False),
+    StructField("ts",             TimestampType(), nullable=True),
 ])
 
+
 def transform_1(spark: SparkSession, logical_date: str) -> DataFrame:
-    """
-    Transformation 1 : Lecture de la couche Silver avec schéma strict et filtrage.
-    """
-    silver_path = f"data/raw/dt={logical_date}/"
-    print(f"[Spark] Lecture des données Silver depuis : {silver_path}")
-    
-    if not os.path.exists(silver_path):
-        raise FileNotFoundError(f"Aucune donnée Silver trouvée pour la date {logical_date}")
-        
-    # Lecture avec application du schéma explicite
-    df = spark.read.schema(SILVER_SCHEMA).parquet(silver_path)
-    
-    # Filtrage de sécurité : Élimination des lignes sans ID ou avec des montants aberrants
-    df_filtered = df.filter((F.col("tx_id").isNotNull()) & (F.col("amount_eur") >= 0))
-    
-    return df_filtered
+    """Read silver Parquet with strict schema; drop rows with null or zero amounts."""
+    pq_path = str(raw_parquet(logical_date))
+    df = spark.read.schema(SILVER_SCHEMA).parquet(pq_path)
+    df = df.filter(
+        F.col("amount_eur").isNotNull()
+        & (F.col("amount_eur") > 0)
+        & F.col("category").isNotNull()
+        & F.col("country").isNotNull()
+    )
+    return df
 
 
-def transform_2(spark: SparkSession, df: DataFrame, logical_date: str, with_reference: bool = False) -> DataFrame:
+def transform_2(spark: SparkSession, df: DataFrame, logical_date: str) -> DataFrame:
     """
-    Transformation 2 : Enrichissement des données et dérivation de colonnes.
+    Enrich the transaction data:
+      - Extract hour of day from the timestamp column
+      - Broadcast-join the small category_targets reference file (Track S)
+
+    broadcast() replicates the 7-row reference table to every Spark worker,
+    avoiding a full shuffle — correct choice when one side is tiny.
     """
-    # Dérivation de colonnes temporelles basées sur la date logique du jour
-    df_enriched = df.withColumn("ingest_day", F.lit(logical_date)) \
-                    .withColumn("processed_at", F.current_timestamp())
-    
-    # Optionnel (Track S/Track Reference) : Jointure avec les cibles de catégories si demandée
-    ref_path = "data/reference/category_targets.csv"
-    if with_reference and os.path.exists(ref_path):
-        print(f"[Spark] Enrichissement via jointure avec le fichier de référence : {ref_path}")
-        df_ref = spark.read.option("header", "true").option("inferSchema", "true").csv(ref_path)
-        # Utilisation d'un Broadcast Join (Optimisation Spark classique pour les petits volumes)
-        df_enriched = df_enriched.join(F.broadcast(df_ref), on="category", how="left")
-        
-    return df_enriched
+    # Parse hour for peak-time analysis
+    df = df.withColumn("hour", F.hour(F.col("ts")))
+
+    # Broadcast join — safe because category_targets.csv has only 7 rows
+    ref_path = reference_targets()
+    if ref_path.exists():
+        ref_df = (
+            spark.read
+            .option("header", True)
+            .csv(str(ref_path))
+            .withColumn("target_revenue_eur", F.col("target_revenue_eur").cast(DoubleType()))
+        )
+        df = df.join(F.broadcast(ref_df), on="category", how="left")
+    else:
+        # Graceful fallback if --reference was never run
+        df = df.withColumn("target_revenue_eur", F.lit(None).cast(DoubleType()))
+
+    return df
 
 
 def transform_3(df: DataFrame) -> DataFrame:
     """
-    Transformation 3 : Agrégation des KPIs demandés par les Opérations.
-    Calcul du chiffre d'affaires total et du volume de transactions par catégorie et pays.
+    Aggregate KPIs by category × country:
+      - total revenue
+      - transaction count
+      - average transaction value
+      - revenue vs target percentage (null when no target available)
     """
-    df_aggregated = df.groupBy("category", "country") \
-                      .agg(
-                          F.round(F.sum("amount_eur"), 2).alias("revenue_eur"),
-                          F.count("tx_id").alias("transaction_count")
-                      )
-    return df_aggregated
+    return (
+        df.groupBy("category", "country", "target_revenue_eur")
+        .agg(
+            F.round(F.sum("amount_eur"),  2).alias("revenue_eur"),
+            F.count("tx_id")              .alias("tx_count"),
+            F.round(F.avg("amount_eur"),  2).alias("avg_tx_eur"),
+        )
+        .withColumn(
+            "revenue_vs_target_pct",
+            F.when(
+                F.col("target_revenue_eur").isNotNull() & (F.col("target_revenue_eur") > 0),
+                F.round((F.col("revenue_eur") / F.col("target_revenue_eur")) * 100, 1),
+            ).otherwise(F.lit(None).cast(DoubleType())),
+        )
+        .orderBy("category", "country")
+    )
 
 
-def run_daily(logical_date: str, *, with_reference: bool = False) -> dict:
+def run_daily(logical_date: str, *, with_reference: bool = True) -> dict:
     """
-    Point d'entrée principal appelé depuis la tâche Airflow @task.
-    Enchaîne transform_1 -> transform_2 -> transform_3 et écrit les résultats.
+    Entry point called from the Airflow compute_kpis task.
+
+    Runs transform_1 -> transform_2 -> transform_3, then writes:
+      - data/curated/dt=<date>/kpis/       (Gold Parquet, overwrite = idempotent)
+      - data/reports/dashboard_<date>.json  (totals + extra KPIs for the BI dashboard)
     """
-    # Initialisation de la SparkSession locale (un seul JVM utilisant tous les cœurs du conteneur)
-    spark = SparkSession.builder \
-        .master("local[*]") \
-        .appName(f"TeamFranklin_Spark_{logical_date}") \
+    spark = (
+        SparkSession.builder
+        .appName(f"franklin_kpis_{logical_date}")
+        .master("local[*]")
+        .config("spark.sql.shuffle.partitions", "4")   # small data — avoid 200 shuffles
         .getOrCreate()
-        
+    )
+
     try:
-        # --- 1. Chaînage des 3 Transformations ---
-        df_silver = transform_1(spark, logical_date)
-        df_gold = transform_2(spark, df_silver, logical_date, with_reference=with_reference)
-        df_kpis = transform_3(df_gold)
-        
-        # Pour éviter les multiples recalculs lors des écritures d'outputs (Action Spark)
-        df_kpis.cache()
-        
-        # --- 2. Écriture de la couche GOLD (Idempotence par écrasement 'overwrite') ---
-        curated_path = f"data/curated/dt={logical_date}/"
-        print(f"[Spark] Écriture des données Gold (Parquet) vers : {curated_path}")
-        
-        df_kpis.write \
-            .mode("overwrite") \
-            .parquet(curated_path)
-            
-        # --- 3. Génération du rapport de la couche SERVE (JSON) ---
-        # Collecte des totaux pour construire le tableau de bord léger attendu
-        totals = df_kpis.select(
-            F.round(F.sum("revenue_eur"), 2).alias("total_revenue"),
-            F.sum("transaction_count").alias("total_transactions")
+        df_silver   = transform_1(spark, logical_date)
+        df_enriched = transform_2(spark, df_silver, logical_date) if with_reference else df_silver.withColumn("hour", F.hour(F.col("ts"))).withColumn("target_revenue_eur", F.lit(None).cast(DoubleType()))
+        df_kpis     = transform_3(df_enriched)
+
+        # ── Write Gold Parquet (overwrite for idempotence) ──────────────────
+        out_parquet = curated_kpis(logical_date).parent / "kpis"
+        out_parquet.mkdir(parents=True, exist_ok=True)
+        df_kpis.write.mode("overwrite").parquet(str(out_parquet))
+
+        # ── Additional aggregations collected for the JSON report ────────────
+        totals = df_silver.agg(
+            F.count("tx_id")                      .alias("tx_count"),
+            F.round(F.sum("amount_eur"), 2)       .alias("total_revenue_eur"),
         ).collect()[0]
-        
-        metrics = {
-            "logical_date": logical_date,
-            "status": "success",
-            "total_revenue_eur": totals["total_revenue"] if totals["total_revenue"] is not None else 0.0,
-            "total_transactions_count": totals["total_transactions"] if totals["total_transactions"] is not None else 0,
-            "paths": {
-                "gold_parquet": curated_path
-            }
-        }
-        
-        # Écriture physique du fichier JSON final
-        report_path = f"data/reports/dashboard_{logical_date}.json"
-        os.makedirs(os.path.dirname(report_path), exist_ok=True)
-        
-        with open(report_path, "w") as f:
-            json.dump(metrics, f, indent=4)
-            
-        print(f"✅ [Spark] Rapport JSON généré avec succès : {report_path}")
-        return metrics
+
+        top_category = (
+            df_silver.groupBy("category")
+            .agg(F.sum("amount_eur").alias("rev"))
+            .orderBy(F.col("rev").desc())
+            .first()["category"]
+        )
+
+        top_country = (
+            df_silver.groupBy("country")
+            .agg(F.sum("amount_eur").alias("rev"))
+            .orderBy(F.col("rev").desc())
+            .first()["country"]
+        )
+
+        peak_row = (
+            df_enriched.groupBy("hour")
+            .agg(F.count("tx_id").alias("cnt"))
+            .orderBy(F.col("cnt").desc())
+            .first()
+        )
+
+        payment_rows = (
+            df_silver.groupBy("country", "payment_method")
+            .agg(F.count("tx_id").alias("tx_count"))
+            .orderBy("country", "payment_method")
+            .collect()
+        )
 
     finally:
-        # Fermeture propre de la session pour libérer la mémoire du conteneur
         spark.stop()
+
+    # ── Write JSON dashboard report (overwrite for idempotence) ─────────────
+    out_json = report_json(logical_date)
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "logical_date":       logical_date,
+        "status":             "ok",
+        "total_tx_count":     int(totals["tx_count"]),
+        "total_revenue_eur":  float(totals["total_revenue_eur"]),
+        "top_category":       top_category,
+        "top_country":        top_country,
+        "peak_hour":          int(peak_row["hour"]) if peak_row else None,
+        "peak_hour_tx_count": int(peak_row["cnt"])  if peak_row else None,
+        "payment_breakdown": [
+            {"country": r["country"], "method": r["payment_method"], "tx_count": int(r["tx_count"])}
+            for r in payment_rows
+        ],
+        "curated_path": str(out_parquet),
+    }
+
+    out_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
