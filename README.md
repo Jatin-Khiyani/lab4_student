@@ -1,12 +1,3 @@
-# Team: Khiyani, Zanna & Kalfadang
-
-**DAG id:** `KHIYANI_ZANNA_KALFADANG`  
-**Git repo:** `https://github.com/Jatin-Khiyani/lab4_student.git` — also on Moodle slides  
-**Spark module:** `include/team_KHIYANI_ZANNA_KALFADANG_spark.py`  
-**Course:** Big Data Processing — Lab 4 Capstone, EPF Engineering School
-
----
-
 ## 1. Business problem
 
 A retail partner sends us one file every day with all their store sales.
